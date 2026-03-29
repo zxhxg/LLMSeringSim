@@ -109,6 +109,7 @@ def main():
     block_mode_on = cluster["block_mode_on"]
     total_npu = cluster["total_npu"]
     cpu_mem_size = cluster["cpu_mem_size"]
+    hbf_mem_size = cluster["hbf_mem_size"]
     power_modeling = cluster["power_modeling"]
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
@@ -193,14 +194,18 @@ def main():
             prefix_pool = prefix_pools[prefix_pool_index]
         cxl_mem = 0
         if cluster["cxl_mem_size"] > 0:
-            cxl_mem = cluster["cxl_mem_size"]        
+            cxl_mem = cluster["cxl_mem_size"]
+        hbf_mem = 0
+        if hbf_mem_size > 0:
+            hbf_mem = hbf_mem_size
         
         # Make scheduler for each instance
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id, max_batch, max_num_batched_tokens,
             instance["npu_num"], instance["npu_group"], instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
             inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req, 
-            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem
+            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem,
+            hbf_mem=hbf_mem, hbf_prefetch=(instance.get("hbf_prefetch") or {"enabled": False})
         ))
 
     # Controller for astra-sim process communication
@@ -246,6 +251,17 @@ def main():
     total_gen = 0
     total_latency = 0
     req_cnt = 0
+    total_hbf_metrics = {
+        "attn_transfer_bytes": 0,
+        "ffn_transfer_bytes": 0,
+        "total_transfer_bytes": 0,
+        "predict_ns": 0,
+        "transfer_ns": 0,
+        "stall_ns": 0,
+        "prefetch_hit_layers": 0,
+        "prefetch_stall_layers": 0,
+    }
+    hbf_enabled_any = any((instance.get("hbf_prefetch") or {}).get("enabled", False) for instance in instances)
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = schedulers[0].get_first_arrival_time()
@@ -319,7 +335,9 @@ def main():
                 generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"], 
                                node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
                                expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction, 
-                               enable_sub_batch_interleaving, fp)
+                               enable_sub_batch_interleaving, fp, instance.get("hbf_prefetch"))
+                for metric_name, metric_value in new_req.hbf_metrics.items():
+                    total_hbf_metrics[metric_name] += metric_value
                 generate_graph(new_req, instance["hardware"], instance["npu_num"], node_id,
                                instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
             workload = get_workload(new_req, instance["hardware"], instance_id)
@@ -497,6 +515,18 @@ def main():
     print(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
     print(f"Throughput per {1/RATIO} sec: {throughput}")
     print(SINGLE_BAR)
+    if hbf_enabled_any:
+        print(magenta(center("HBF Prefetch Results")))
+        print(SINGLE_BAR)
+        print(f"HBF attention transfer bytes:                                      {total_hbf_metrics['attn_transfer_bytes']}")
+        print(f"HBF FFN transfer bytes:                                            {total_hbf_metrics['ffn_transfer_bytes']}")
+        print(f"HBF total transfer bytes:                                          {total_hbf_metrics['total_transfer_bytes']}")
+        print(f"HBF predict time (ns):                                             {total_hbf_metrics['predict_ns']}")
+        print(f"HBF transfer time (ns):                                            {total_hbf_metrics['transfer_ns']}")
+        print(f"HBF stall time (ns):                                               {total_hbf_metrics['stall_ns']}")
+        print(f"HBF prefetched layers:                                             {total_hbf_metrics['prefetch_hit_layers']}")
+        print(f"HBF stall layers:                                                  {total_hbf_metrics['prefetch_stall_layers']}")
+        print(SINGLE_BAR)
     if enable_prefix_caching:
         print(magenta(center("Prefix Caching Results")))
         print(SINGLE_BAR)

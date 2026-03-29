@@ -93,3 +93,42 @@
 | `single_node_power_instance.json` | 启用功耗建模的单节点 |
 | `single_node_memory_instance.json` | 单节点内存层级配置 |
 | `dual_node_multi_instance.json` | 双节点、多实例 |
+
+## HBF 配置
+
+当需要启用 HBF 权重分层与预取时，需要同时配置顶层 `hbf_mem` 和实例级 `hbf_prefetch`。
+
+顶层 `hbf_mem` 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `mem_size` | Float | HBF 容量，单位为 GB |
+| `mem_bw` | Float | HBF 带宽，单位为 GB/s |
+| `mem_latency` | Float | HBF 访问时延，单位为 ns |
+| `num_devices` | Integer | HBF 设备数量 |
+
+实例级 `hbf_prefetch` 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | Boolean | 是否启用 HBF 预取 |
+| `ffn_ratio` | Float | FFN 稀疏传输比例，范围 `[0, 1]` |
+| `predict_base_ns` | Integer | 基础预测时间 |
+| `predict_attn_ns` | Integer | Attention 预测时间 |
+| `predict_ffn_ns` | Integer | FFN 预测时间 |
+
+placement 规则中可使用 `hbf[:id]`。例如：
+
+```json
+{
+  "placement": {
+    "default": {
+      "weights": "hbf:0",
+      "kv_loc": "npu",
+      "kv_evict_loc": "cpu"
+    }
+  }
+}
+```
+
+在 HBF 模式下，dense hidden-layer 的 Attention / FFN 权重会被自动解释为从 HBF 进入 HBM buffer；不需要再手工逐层拆分 qkv、o_proj 和 FFN 三个投影层的放置规则。

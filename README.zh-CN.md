@@ -243,3 +243,32 @@ Jaehong Cho, Minsu Kim, Hyunmin Choi, Guseul Heo, Jongse Park (KAIST) [[Paper]](
     doi={10.1109/IISWC63097.2024.00012}
 }
 ```
+
+## HBF 权重分层与预取
+
+当前版本新增了 HBF（High Bandwidth Flash）权重分层与预取模拟机制，核心行为如下：
+
+- KV cache、activations、embedding、LayerNorm、bias 与当前层 HBM weight buffer 视为 HBM 本地资源。
+- Attention 权重与 FFN 权重常驻 HBF，并统一走 `HBF -> HBM -> compute` 路径。
+- 执行 layer `i` 时，会并行触发 layer `i+1` 的 `hbf_predict`、Attention 全量预取和 FFN 稀疏预取。
+- FFN 传输量由 `ffn_ratio` 控制，Attention 不做稀疏。
+- stall 严格按 `max(0, T_predict + T_transfer - T_compute)` 计算。
+
+示例配置见 `cluster_config/single_node_hbf_instance.json`。
+
+示例运行命令：
+
+```bash
+python main.py \
+    --cluster-config "cluster_config/single_node_hbf_instance.json" \
+    --fp 16 --block-size 16 \
+    --dataset "dataset/sharegpt_req100_rate10_llama.jsonl" \
+    --output "output/hbf_example.csv" \
+    --num-req 100 --log-interval 1.0
+```
+
+当前限制：
+
+- HBF 首版仅支持 dense Transformer。
+- 若模型含 `num_local_experts` 且启用 `hbf_prefetch.enabled=true`，会直接报错。
+- 最终对比测试要求在 Docker 中执行；若测试失败，应只记录问题，不在测试任务里修改代码。

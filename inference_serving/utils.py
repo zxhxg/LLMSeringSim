@@ -28,7 +28,7 @@ DOUBLE_BAR = "=" * WIDTH
 
 # Formatting string for layer info
 _FMT = (
-    "{:<30}"  # Layername
+    "{:<48}"  # Layername
     "{:<15}"  # comp_time
     "{:<15}"  # input_loc
     "{:<15}"  # input_size
@@ -53,7 +53,7 @@ def get_workload(batch, hardware, instance_id=0, event=False):
 
 def header():
     string_list = ["Layername","comp_time","input_loc","input_size","weight_loc","weight_size","output_loc","output_size","comm_type","comm_size","misc"]
-    ileft_list = [30,15,15,15,15,15,15,15,15,15,15]
+    ileft_list = [48,15,15,15,15,15,15,15,15,15,15]
     output = ""
     for string, ileft in zip(string_list, ileft_list):
         output += ('{0:<'+str(ileft)+'}').format(string)

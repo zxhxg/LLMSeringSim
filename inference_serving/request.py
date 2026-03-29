@@ -83,3 +83,13 @@ class Batch:
         self.prefill_q_list = prefill_q_list
         self.prefill_k_list = prefill_k_list
         self.decode_k_list = decode_k_list
+        self.hbf_metrics = {
+            "attn_transfer_bytes": 0,
+            "ffn_transfer_bytes": 0,
+            "total_transfer_bytes": 0,
+            "predict_ns": 0,
+            "transfer_ns": 0,
+            "stall_ns": 0,
+            "prefetch_hit_layers": 0,
+            "prefetch_stall_layers": 0,
+        }

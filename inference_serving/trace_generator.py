@@ -5,7 +5,12 @@ from .request import *
 from .utils import *
 from .attn_utils import *
 import pandas as pd
-from .memory_model import calculate_sizes
+from .memory_model import (
+    STATIC_HBM_WEIGHT_LAYERS,
+    calculate_sizes,
+    get_dense_block_weight_summary,
+    is_weightless_layer,
+)
 from .gate_function import GateRouter
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
@@ -36,10 +41,122 @@ _attn_prediction_value_cache = {}
 
 logger = get_logger("TraceGenerator")
 
+
+def _hbf_enabled(hbf_prefetch):
+    return bool(hbf_prefetch and hbf_prefetch.get("enabled", False))
+
+
+def _resolve_weight_device(placement, layer_num, layer_name, hbf_prefetch):
+    if not _hbf_enabled(hbf_prefetch):
+        return get_device(placement, layer_num, layer_name, "weights")
+    if layer_name in STATIC_HBM_WEIGHT_LAYERS or is_weightless_layer(layer_name):
+        return "LOCAL"
+
+    source = get_device(placement, layer_num, None, "weights")
+    if not str(source).upper().startswith("HBF"):
+        raise ValueError(
+            f"HBF prefetch requires hidden-layer weights to be placed on HBF, but block {layer_num} resolves to '{source}'."
+        )
+    return source
+
+
+def _new_hbf_metrics():
+    return {
+        "attn_transfer_bytes": 0,
+        "ffn_transfer_bytes": 0,
+        "total_transfer_bytes": 0,
+        "predict_ns": 0,
+        "transfer_ns": 0,
+        "stall_ns": 0,
+        "prefetch_hit_layers": 0,
+        "prefetch_stall_layers": 0,
+    }
+
+
+def _estimate_transfer_ns(bytes_size, hbf_prefetch):
+    if bytes_size <= 0:
+        return 0
+    mem_bw = float(hbf_prefetch.get("mem_bw", 0))
+    mem_latency = int(hbf_prefetch.get("mem_latency", 0))
+    if mem_bw <= 0:
+        return 0
+    return mem_latency + int(bytes_size / mem_bw)
+
+
+def _append_hbf_prefetch_rows(block_res, model, layer_num, num_hidden_layers, placement, npus_per_group, fp, hbf_prefetch, hbf_metrics):
+    if not _hbf_enabled(hbf_prefetch) or layer_num >= (num_hidden_layers - 1):
+        return
+
+    target_block = layer_num + 1
+    source_device = get_device(placement, target_block, None, "weights")
+    if not str(source_device).upper().startswith("HBF"):
+        raise ValueError(
+            f"HBF prefetch requires block {target_block} weights to resolve to HBF, but got '{source_device}'."
+        )
+
+    predict_ns = int(hbf_prefetch.get("predict_base_ns", 0)) + int(hbf_prefetch.get("predict_attn_ns", 0)) + int(hbf_prefetch.get("predict_ffn_ns", 0))
+    block_summary = get_dense_block_weight_summary(model, npus_per_group, fp, float(hbf_prefetch.get("ffn_ratio", 1.0)))
+    attn_transfer = block_summary["attn_full"]
+    ffn_transfer = block_summary["ffn_transfer"]
+
+    if predict_ns > 0:
+        block_res.append(formatter(
+            f"hbf_pred_b{target_block}",
+            str(predict_ns),
+            "LOCAL",
+            "0",
+            "LOCAL",
+            "0",
+            "LOCAL",
+            "0",
+            "NONE",
+            "0",
+            "HBF_PREDICT",
+        ))
+
+    if attn_transfer > 0:
+        block_res.append(formatter(
+            f"hbf_pf_attn_b{target_block}",
+            "0",
+            "LOCAL",
+            "0",
+            source_device,
+            str(attn_transfer),
+            "LOCAL",
+            "0",
+            "NONE",
+            "0",
+            "HBF_PREFETCH",
+        ))
+
+    if ffn_transfer > 0:
+        block_res.append(formatter(
+            f"hbf_pf_ffn_b{target_block}",
+            "0",
+            "LOCAL",
+            "0",
+            source_device,
+            str(ffn_transfer),
+            "LOCAL",
+            "0",
+            "NONE",
+            "0",
+            "HBF_PREFETCH",
+        ))
+
+    transfer_ns = _estimate_transfer_ns(attn_transfer, hbf_prefetch) + _estimate_transfer_ns(ffn_transfer, hbf_prefetch)
+    hbf_metrics["attn_transfer_bytes"] += attn_transfer
+    hbf_metrics["ffn_transfer_bytes"] += ffn_transfer
+    hbf_metrics["total_transfer_bytes"] += attn_transfer + ffn_transfer
+    hbf_metrics["predict_ns"] += predict_ns
+    hbf_metrics["transfer_ns"] += transfer_ns
+    hbf_metrics["prefetch_hit_layers"] += 1
+
 # Wrapper function that creates trace for a instance
 def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0, instance_id=0,
                     max_num_batched_tokens=2048, placement={}, block_mode_on=False, expert_routing_policy="RR",
-                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None, enable_attn_prediction=False, enable_sub_batch_interleaving=False, fp=16):
+                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
+                    enable_attn_prediction=False, enable_sub_batch_interleaving=False, fp=16, hbf_prefetch=None):
 
     model = batch.model
     config = get_config(model)
@@ -67,18 +184,19 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
         power_model.reset_log()
 
     # make trace
-    if not enable_sub_batch_interleaving:
-        _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
-                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp)
+    if not enable_sub_batch_interleaving or _hbf_enabled(hbf_prefetch):
+        hbf_metrics = _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
+                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp, hbf_prefetch)
     else:
         batches = _make_sub_batch(batch)
         if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
             # not enough requests to split, fall back to normal trace generation
-            _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
-                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp)
+            hbf_metrics = _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
+                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp, hbf_prefetch)
         else:
             _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batches, max_len, output_path,
                         placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp)
+            hbf_metrics = _new_hbf_metrics()
 
 
     with open(output_path, 'r') as f:
@@ -127,11 +245,13 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
                 f.write(formatter(new_string, *result[i][1:]))
             else:
                 f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
+    batch.hbf_metrics = hbf_metrics
     return
 
 # Generates trace for the batch
 def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
-                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp):
+                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                     hbf_prefetch):
     
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
@@ -190,23 +310,24 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
         req_ids,
         extra={"node_id": node_id, "instance_id": instance_id},
     )
+    hbf_metrics = _new_hbf_metrics()
 
     with open(output_path, 'w') as f:
         # embedding layer
         embedding_matching_row = _get_perf_row(perf_db, hardware, "embedding", total_len, 0, npus_per_group)
         emb_input, emb_weight, emb_output = calculate_sizes(model, embedding_matching_row["layer_name"], total_len, fp=fp)
         f.write(formatter(str(embedding_matching_row["layer_name"]), str(embedding_matching_row['latency(ns)']), f'REMOTE:{node_id}',
-             str(emb_input), get_device(placement, None, "embedding", "weights"), str(emb_weight), 'LOCAL', str(emb_output), 'NONE', '0', 'NONE'))
+             str(emb_input), _resolve_weight_device(placement, None, "embedding", hbf_prefetch), str(emb_weight), 'LOCAL', str(emb_output), 'NONE', '0', 'NONE'))
 
         # add power
         if power_model is not None:
             power_model.add_npu_active_energy_consumption(hardware, node_id, int(embedding_matching_row['latency(ns)']), npu_nums=npus_per_group)
-            if get_device(placement, None, "embedding", "weights") != 'LOCAL':
+            if _resolve_weight_device(placement, None, "embedding", hbf_prefetch) != 'LOCAL':
                 power_model.add_dram_energy_consumption(node_id, emb_weight)
             
         iter = 1
         copy = config['num_hidden_layers']
-        if block_mode_on:
+        if block_mode_on or _hbf_enabled(hbf_prefetch):
             iter = copy
             copy = 1
         for layer_num in range(iter):
@@ -220,33 +341,33 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
 
             input_ln_matching_row = _get_perf_row(perf_db, hardware, "input_layernorm", total_len, 0, npus_per_group)
             in_ln_input, in_ln_weight, in_ln_output = calculate_sizes(model, input_ln_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-            block_res.append(formatter(str(input_ln_matching_row["layer_name"]), str(input_ln_matching_row['latency(ns)']), 'LOCAL', str(in_ln_input), get_device(placement, layer_num, "input_layernorm", "weights"), str(in_ln_weight), 'LOCAL', str(in_ln_output), 'NONE', '0', 'NONE'))
+            block_res.append(formatter(str(input_ln_matching_row["layer_name"]), str(input_ln_matching_row['latency(ns)']), 'LOCAL', str(in_ln_input), _resolve_weight_device(placement, layer_num, "input_layernorm", hbf_prefetch), str(in_ln_weight), 'LOCAL', str(in_ln_output), 'NONE', '0', 'NONE'))
 
             if power_model is not None:
                 latency_power_list.append(input_ln_matching_row['latency(ns)'])
-                if get_device(placement, layer_num, "input_layernorm", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "input_layernorm", hbf_prefetch) != 'LOCAL':
                     block_load_weight += in_ln_weight
 
             # q, k ,v 
             q_matching_row = _get_perf_row(perf_db, hardware, "q_proj", total_len, 0, npus_per_group)
             q_input, q_weight, q_output = calculate_sizes(model, q_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-            block_res.append(formatter(str(q_matching_row["layer_name"]), str(q_matching_row['latency(ns)']), 'LOCAL', str(q_input), get_device(placement, layer_num, "q_proj", "weights"), str(q_weight), 'LOCAL',  str(q_output), 'NONE', '0', 'NONE'))
+            block_res.append(formatter(str(q_matching_row["layer_name"]), str(q_matching_row['latency(ns)']), 'LOCAL', str(q_input), _resolve_weight_device(placement, layer_num, "q_proj", hbf_prefetch), str(q_weight), 'LOCAL',  str(q_output), 'NONE', '0', 'NONE'))
             k_matching_row = _get_perf_row(perf_db, hardware, "k_proj", total_len, 0, npus_per_group)
             k_input, k_weight, k_output = calculate_sizes(model, k_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-            block_res.append(formatter(str(k_matching_row["layer_name"]), str(k_matching_row['latency(ns)']), 'LOCAL', str(k_input), get_device(placement, layer_num, "k_proj", "weights"), str(k_weight), 'LOCAL',  str(k_output), 'NONE', '0', 'NONE'))
+            block_res.append(formatter(str(k_matching_row["layer_name"]), str(k_matching_row['latency(ns)']), 'LOCAL', str(k_input), _resolve_weight_device(placement, layer_num, "k_proj", hbf_prefetch), str(k_weight), 'LOCAL',  str(k_output), 'NONE', '0', 'NONE'))
             v_matching_row = _get_perf_row(perf_db, hardware, "v_proj", total_len, 0, npus_per_group)
             v_input, v_weight, v_output = calculate_sizes(model, v_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-            block_res.append(formatter(str(v_matching_row["layer_name"]), str(v_matching_row['latency(ns)']), 'LOCAL', str(v_input), get_device(placement, layer_num, "v_proj", "weights"), str(v_weight), 'LOCAL',  str(v_output), 'NONE', '0', 'NONE'))
+            block_res.append(formatter(str(v_matching_row["layer_name"]), str(v_matching_row['latency(ns)']), 'LOCAL', str(v_input), _resolve_weight_device(placement, layer_num, "v_proj", hbf_prefetch), str(v_weight), 'LOCAL',  str(v_output), 'NONE', '0', 'NONE'))
 
             if power_model is not None:
                 latency_power_list.append(q_matching_row['latency(ns)'])
-                if get_device(placement, layer_num, "q_proj", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "q_proj", hbf_prefetch) != 'LOCAL':
                     block_load_weight += q_weight
                 latency_power_list.append(k_matching_row['latency(ns)'])
-                if get_device(placement, layer_num, "k_proj", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "k_proj", hbf_prefetch) != 'LOCAL':
                     block_load_weight += k_weight
                 latency_power_list.append(v_matching_row['latency(ns)'])
-                if get_device(placement, layer_num, "v_proj", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "v_proj", hbf_prefetch) != 'LOCAL':
                     block_load_weight += v_weight
 
             
@@ -255,7 +376,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                 # RoPE
                 rope_matching_row = _get_perf_row(perf_db, hardware, "rope", total_len, 0, npus_per_group)
                 rope_input, rope_weight, rope_output = calculate_sizes(model, rope_matching_row["layer_name"], total_len, True, tp=npus_per_group, fp=fp)
-                block_res.append(formatter(str(rope_matching_row["layer_name"]), str(rope_matching_row['latency(ns)']), 'LOCAL', str(rope_input), get_device(placement, layer_num, "rope", "weights"), str(rope_weight), 'LOCAL', str(rope_output), 'NONE', '0', 'NONE'))
+                block_res.append(formatter(str(rope_matching_row["layer_name"]), str(rope_matching_row['latency(ns)']), 'LOCAL', str(rope_input), _resolve_weight_device(placement, layer_num, "rope", hbf_prefetch), str(rope_weight), 'LOCAL', str(rope_output), 'NONE', '0', 'NONE'))
                 
                 if power_model is not None:
                     latency_power_list.append(rope_matching_row['latency(ns)'])
@@ -270,7 +391,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                         iter_latency = 0
                         attn_input, attn_weight, attn_output =  tuple(size // channel_split for size in calculate_sizes(model, "attn", L, pim=True, tp=npus_per_group, fp=fp)) # only add new tensors that needs to be sent to PIM & split across channels
                         pim_latency = int(pim_model.get_pim_latency(n_head, kv_head, head_dim, L, channel_split))
-                        block_res.append(formatter("attn", str(pim_latency), f'REMOTE:{node_id}.{i}', str(attn_input), get_device(placement, layer_num, "attn", "weights"), str(attn_weight), f'REMOTE:{node_id}.{i}', str(attn_output), 'NONE', '0', 'NONE'))
+                        block_res.append(formatter("attn", str(pim_latency), f'REMOTE:{node_id}.{i}', str(attn_input), _resolve_weight_device(placement, layer_num, "attn", hbf_prefetch), str(attn_weight), f'REMOTE:{node_id}.{i}', str(attn_output), 'NONE', '0', 'NONE'))
                         if power_model is not None and pim_latency > 0:
                             pim_power_list.append(pim_latency)
                             # update input/output store/load while pim operation
@@ -330,7 +451,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
 
                     attn_latency_ns =  prefill_attn_latency + decode_attn_latency
 
-                block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, layer_num, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'NONE'))
+                block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), _resolve_weight_device(placement, layer_num, "attn", hbf_prefetch), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'NONE'))
 
                 if power_model is not None:
                     latency_power_list.append(attn_latency_ns)
@@ -350,42 +471,42 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                     o_proj_tp_pd_kv_prepare =  700_000
                 if pd_type == "decode":
                     o_proj_tp_pd_kv_prepare =  700 * decode_key[0]
-            block_res.append(formatter(str(o_proj_matching_row["layer_name"]), str(o_proj_matching_row['latency(ns)'] + o_proj_tp_pd_kv_prepare), 'LOCAL', str(o_proj_input), get_device(placement, layer_num, "o_proj", "weights"), str(o_proj_weight), 'LOCAL', str(o_proj_output), o_proj_comm_type, str(o_proj_comm_size), 'NONE'))
+            block_res.append(formatter(str(o_proj_matching_row["layer_name"]), str(o_proj_matching_row['latency(ns)'] + o_proj_tp_pd_kv_prepare), 'LOCAL', str(o_proj_input), _resolve_weight_device(placement, layer_num, "o_proj", hbf_prefetch), str(o_proj_weight), 'LOCAL', str(o_proj_output), o_proj_comm_type, str(o_proj_comm_size), 'NONE'))
             if power_model is not None:
                 latency_power_list.append(o_proj_matching_row['latency(ns)'])
                 ring_data = total_ring_data(o_proj_comm_size, npus_per_group, collective="allreduce")
                 block_link_data += ring_data
-                if get_device(placement, layer_num, "o_proj", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "o_proj", hbf_prefetch) != 'LOCAL':
                     block_load_weight += o_proj_weight
             # layer norm2
             layer_norm2_matching_row = _get_perf_row(perf_db, hardware, "post_layernorm", total_len, 0, npus_per_group)
             layer_norm2_input, layer_norm2_weight, layer_norm2_output = calculate_sizes(model, layer_norm2_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-            block_res.append(formatter(str(layer_norm2_matching_row["layer_name"]), str(layer_norm2_matching_row["latency(ns)"]), 'LOCAL', str(layer_norm2_input), get_device(placement, layer_num, "post_layernorm", "weights"), str(layer_norm2_weight), 'LOCAL', str(layer_norm2_output), 'NONE', '0', 'NONE'))
+            block_res.append(formatter(str(layer_norm2_matching_row["layer_name"]), str(layer_norm2_matching_row["latency(ns)"]), 'LOCAL', str(layer_norm2_input), _resolve_weight_device(placement, layer_num, "post_layernorm", hbf_prefetch), str(layer_norm2_weight), 'LOCAL', str(layer_norm2_output), 'NONE', '0', 'NONE'))
             if power_model is not None: 
                 latency_power_list.append(layer_norm2_matching_row['latency(ns)'])
-                if get_device(placement, layer_num, "post_layernorm", "weights") != 'LOCAL':
+                if _resolve_weight_device(placement, layer_num, "post_layernorm", hbf_prefetch) != 'LOCAL':
                     block_load_weight += layer_norm2_weight
 
             if gate == None: # non-MoE model
                 gate_proj_matching_row = _get_perf_row(perf_db, hardware, "gate_proj", total_len, 0, npus_per_group)
                 gate_proj_input, gate_proj_weight, gate_proj_output = calculate_sizes(model, gate_proj_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-                block_res.append(formatter(str(gate_proj_matching_row["layer_name"]), str(gate_proj_matching_row['latency(ns)']), 'LOCAL', str(gate_proj_input), get_device(placement, layer_num, "gate_proj", "weights"), str(gate_proj_weight), 'LOCAL', str(gate_proj_output), 'NONE', '0', 'NONE'))
+                block_res.append(formatter(str(gate_proj_matching_row["layer_name"]), str(gate_proj_matching_row['latency(ns)']), 'LOCAL', str(gate_proj_input), _resolve_weight_device(placement, layer_num, "gate_proj", hbf_prefetch), str(gate_proj_weight), 'LOCAL', str(gate_proj_output), 'NONE', '0', 'NONE'))
                 if power_model is not None:
                     latency_power_list.append(gate_proj_matching_row['latency(ns)'])
-                    if get_device(placement, layer_num, "gate_proj", "weights") != 'LOCAL':
+                    if _resolve_weight_device(placement, layer_num, "gate_proj", hbf_prefetch) != 'LOCAL':
                         block_load_weight += gate_proj_weight
                 
                 up_proj_matching_row = _get_perf_row(perf_db, hardware,"up_proj", total_len, 0, npus_per_group)
                 up_proj_input, up_proj_weight, up_proj_output = calculate_sizes(model, up_proj_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-                block_res.append(formatter(str(up_proj_matching_row["layer_name"]), str(up_proj_matching_row['latency(ns)']), 'LOCAL', str(up_proj_input), get_device(placement, layer_num, "up_proj", "weights"), str(up_proj_weight), 'LOCAL', str(up_proj_output), 'NONE', '0', 'NONE'))
+                block_res.append(formatter(str(up_proj_matching_row["layer_name"]), str(up_proj_matching_row['latency(ns)']), 'LOCAL', str(up_proj_input), _resolve_weight_device(placement, layer_num, "up_proj", hbf_prefetch), str(up_proj_weight), 'LOCAL', str(up_proj_output), 'NONE', '0', 'NONE'))
                 if power_model is not None:
                     latency_power_list.append(up_proj_matching_row['latency(ns)'])
-                    if get_device(placement, layer_num, "up_proj", "weights") != 'LOCAL':
+                    if _resolve_weight_device(placement, layer_num, "up_proj", hbf_prefetch) != 'LOCAL':
                         block_load_weight += up_proj_weight
 
                 act_matching_row = _get_perf_row(perf_db, hardware, "act_fn", total_len, 0, npus_per_group)
                 act_input, act_weight, act_output = calculate_sizes(model, act_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-                block_res.append(formatter(str(act_matching_row["layer_name"]), str(act_matching_row['latency(ns)']), 'LOCAL', str(act_input), get_device(placement, layer_num, "act_fn", "weights"), str(act_weight), 'LOCAL', str(act_output), 'NONE', '0', 'NONE'))
+                block_res.append(formatter(str(act_matching_row["layer_name"]), str(act_matching_row['latency(ns)']), 'LOCAL', str(act_input), _resolve_weight_device(placement, layer_num, "act_fn", hbf_prefetch), str(act_weight), 'LOCAL', str(act_output), 'NONE', '0', 'NONE'))
                 if power_model is not None:
                     latency_power_list.append(act_matching_row['latency(ns)'])
                     # activation has no weights to load so no power model update
@@ -398,12 +519,12 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                 if npus_per_group > 1:
                     down_proj_comm_size = down_proj_output
                     down_proj_comm_type = 'ALLREDUCE'
-                block_res.append(formatter(str(down_proj_matching_row["layer_name"]), str(down_proj_matching_row['latency(ns)']), 'LOCAL', str(down_proj_input), get_device(placement, layer_num, "down_proj", "weights"), str(down_proj_weight), 'LOCAL', str(down_proj_output), down_proj_comm_type, str(down_proj_comm_size), 'NONE'))
+                block_res.append(formatter(str(down_proj_matching_row["layer_name"]), str(down_proj_matching_row['latency(ns)']), 'LOCAL', str(down_proj_input), _resolve_weight_device(placement, layer_num, "down_proj", hbf_prefetch), str(down_proj_weight), 'LOCAL', str(down_proj_output), down_proj_comm_type, str(down_proj_comm_size), 'NONE'))
                 if power_model is not None:
                     latency_power_list.append(down_proj_matching_row['latency(ns)'])
                     ring_data = total_ring_data(down_proj_comm_size, npus_per_group, collective="allreduce")
                     block_link_data += ring_data
-                    if get_device(placement, layer_num, "down_proj", "weights") != 'LOCAL':
+                    if _resolve_weight_device(placement, layer_num, "down_proj", hbf_prefetch) != 'LOCAL':
                         block_load_weight += down_proj_weight
 
             else: # MoE model
@@ -481,6 +602,27 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                     ring_data = total_ring_data(gate_comm_size, npus_per_group, collective="alltoall")  # same size as gate output
                     block_link_data += ring_data
 
+            _append_hbf_prefetch_rows(
+                block_res,
+                model,
+                layer_num,
+                config['num_hidden_layers'],
+                placement,
+                npus_per_group,
+                fp,
+                hbf_prefetch,
+                hbf_metrics,
+            )
+            if _hbf_enabled(hbf_prefetch) and layer_num < (config['num_hidden_layers'] - 1):
+                block_summary = get_dense_block_weight_summary(model, npus_per_group, fp, float(hbf_prefetch.get("ffn_ratio", 1.0)))
+                predict_ns = int(hbf_prefetch.get("predict_base_ns", 0)) + int(hbf_prefetch.get("predict_attn_ns", 0)) + int(hbf_prefetch.get("predict_ffn_ns", 0))
+                transfer_ns = _estimate_transfer_ns(block_summary["attn_full"], hbf_prefetch) + _estimate_transfer_ns(block_summary["ffn_transfer"], hbf_prefetch)
+                compute_ns = sum(latency_power_list)
+                stall_ns = max(0, predict_ns + transfer_ns - compute_ns)
+                hbf_metrics["stall_ns"] += stall_ns
+                if stall_ns > 0:
+                    hbf_metrics["prefetch_stall_layers"] += 1
+
             # copy and paste blocks
             if (gate == None or gate.routing_policy == "FAST") and not block_mode_on:
                 for i in range(copy):
@@ -509,20 +651,20 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
         # add final layer norm
         final_ln_matching_row = _get_perf_row(perf_db, hardware, "final_layernorm", total_len, 0, npus_per_group)
         final_ln_input, final_ln_weight, final_ln_output = calculate_sizes(model, final_ln_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)
-        f.write(formatter(str(final_ln_matching_row["layer_name"]), str(final_ln_matching_row['latency(ns)']), 'LOCAL', str(final_ln_input), get_device(placement, None, "final_layernorm", "weights"), str(final_ln_weight), 'LOCAL', str(final_ln_output), 'NONE', '0', 'NONE'))
+        f.write(formatter(str(final_ln_matching_row["layer_name"]), str(final_ln_matching_row['latency(ns)']), 'LOCAL', str(final_ln_input), _resolve_weight_device(placement, None, "final_layernorm", hbf_prefetch), str(final_ln_weight), 'LOCAL', str(final_ln_output), 'NONE', '0', 'NONE'))
 
         # add lm_head layer (in vllm, tokens excpet last token are not used in lm_head)
         lm_matching_row = _get_perf_row(perf_db, hardware, "lm_head", lm_head_len, 0, npus_per_group)
         lm_input, lm_weight, lm_output = calculate_sizes(model, lm_matching_row["layer_name"], total_len, tp=npus_per_group, fp=fp)  # use total_len for pipeline tensor size matching, actually should be lm_head_len
-        f.write(formatter(str(lm_matching_row["layer_name"]), str(lm_matching_row['latency(ns)']), 'LOCAL', str(lm_input), get_device(placement, None, "lm_head", "weights"), str(lm_weight), f'REMOTE:{node_id}', str(lm_output), 'NONE', '0', 'NONE'))
+        f.write(formatter(str(lm_matching_row["layer_name"]), str(lm_matching_row['latency(ns)']), 'LOCAL', str(lm_input), _resolve_weight_device(placement, None, "lm_head", hbf_prefetch), str(lm_weight), f'REMOTE:{node_id}', str(lm_output), 'NONE', '0', 'NONE'))
         f.flush()
 
         if power_model is not None:
             power_model.add_npu_active_energy_consumption(hardware, node_id, final_ln_matching_row['latency(ns)'], npu_nums=npus_per_group)
             power_model.add_npu_active_energy_consumption(hardware, node_id, lm_matching_row['latency(ns)'], npu_nums=npus_per_group)
-            if get_device(placement, None, "final_layernorm", "weights") != 'LOCAL':
+            if _resolve_weight_device(placement, None, "final_layernorm", hbf_prefetch) != 'LOCAL':
                 power_model.add_dram_energy_consumption(node_id, final_ln_weight)
-            if get_device(placement, None, "lm_head", "weights") != 'LOCAL':
+            if _resolve_weight_device(placement, None, "lm_head", hbf_prefetch) != 'LOCAL':
                 power_model.add_dram_energy_consumption(node_id, lm_weight)
 
         # add pipeline parallelism send/recv power consumption
@@ -536,6 +678,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
             kv_comm_size = total_len * config['hidden_size'] * fp # total_len of prefill is same as sum of total inputs (no generation)
             output_size = lm_head_len * config['hidden_size'] * fp # output is only lm_head_len tokens
             power_model.add_link_energy_consumption(node_id, kv_comm_size + output_size)
+    return hbf_metrics
 
 # Generates trace for two sub-batches to maximize hardware utilization
 def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batches, max_len, output_path,

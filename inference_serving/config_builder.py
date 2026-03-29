@@ -65,6 +65,20 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         }
         cxl_mem_size = cxl["mem_size"]
 
+    hbf_mem_size = 0
+    if "hbf_mem" in cluster_config:
+        hbf = cluster_config["hbf_mem"]
+        for key in mem_required_keys:
+            if key not in hbf:
+                raise KeyError(f"Missing required key '{key}' in 'hbf_mem' configuration.")
+        memory_config["hbf_mem"] = {
+            "memory-type": "MEMORY_POOL",
+            "mem-bw": hbf["mem_bw"],
+            "mem-latency": hbf["mem_latency"],
+            "num-devices": hbf.get("num_devices", 1)
+        }
+        hbf_mem_size = hbf["mem_size"]
+
     # Check if all required arguments are present in each node
     required_keys = ["num_instances", "cpu_mem", "instances"]
     # Check if power modeling is specified in each node
@@ -153,6 +167,26 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for key in required_keys:
                 if key not in instance:
                     raise KeyError(f"Missing required key '{key}' in instance configuration.")
+
+            hbf_prefetch = instance.get("hbf_prefetch") or {}
+            if hbf_prefetch.get("enabled", False):
+                if "hbf_mem" not in cluster_config:
+                    raise KeyError("Instance enables 'hbf_prefetch', but cluster-level 'hbf_mem' is missing.")
+                ffn_ratio = float(hbf_prefetch.get("ffn_ratio", 1.0))
+                if not 0.0 <= ffn_ratio <= 1.0:
+                    raise ValueError(f"Invalid hbf_prefetch.ffn_ratio={ffn_ratio}. It must be in [0, 1].")
+                config = get_config(instance["model_name"])
+                if "num_local_experts" in config:
+                    raise ValueError(
+                        f"HBF prefetch currently supports dense models only, but '{instance['model_name']}' is a MoE model."
+                    )
+                hbf_prefetch.setdefault("predict_base_ns", 0)
+                hbf_prefetch.setdefault("predict_attn_ns", 0)
+                hbf_prefetch.setdefault("predict_ffn_ns", 0)
+                hbf_prefetch.setdefault("mem_bw", hbf["mem_bw"])
+                hbf_prefetch.setdefault("mem_latency", hbf["mem_latency"])
+                hbf_prefetch["ffn_ratio"] = ffn_ratio
+                instance["hbf_prefetch"] = hbf_prefetch
             
             instance["node_id"] = node_id
             instance["instance_id"] = inst_id
@@ -396,6 +430,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "total_npu": total_npu,
         "cpu_mem_size": cpu_mem_size,
         "cxl_mem_size": cxl_mem_size,
+        "hbf_mem_size": hbf_mem_size,
         "power_modeling": power_modeling,
         "power_configs": power_configs,
         "pim_models": pim_models
@@ -553,6 +588,8 @@ def _mem_str(loc, node_id):
     elif loc.upper().startswith("CPU"):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
+        return loc.upper()
+    elif loc.upper().startswith("HBF"):
         return loc.upper()
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")

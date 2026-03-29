@@ -12,9 +12,59 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    HBF = 4
+
+
+STATIC_HBM_WEIGHT_LAYERS = {
+    "embedding",
+    "input_layernorm",
+    "post_layernorm",
+    "final_layernorm",
+    "lm_head",
+}
+HBF_ATTN_WEIGHT_LAYERS = {"q_proj", "k_proj", "v_proj", "o_proj"}
+HBF_FFN_WEIGHT_LAYERS = {"gate_proj", "up_proj", "down_proj", "fc1", "fc2"}
+ZERO_WEIGHT_LAYERS = {"attn", "rope", "act_fn"}
+
+
+def is_hbf_attention_weight_layer(layer_name):
+    return layer_name in HBF_ATTN_WEIGHT_LAYERS
+
+
+def is_hbf_ffn_weight_layer(layer_name):
+    return layer_name in HBF_FFN_WEIGHT_LAYERS
+
+
+def is_static_hbm_weight_layer(layer_name):
+    return layer_name in STATIC_HBM_WEIGHT_LAYERS
+
+
+def is_weightless_layer(layer_name):
+    return layer_name in ZERO_WEIGHT_LAYERS
+
+
+def get_dense_layer_weight_bytes(model, layer_name, tp, fp_bytes):
+    _, weight_size, _ = calculate_sizes(model, layer_name, 1, tp=tp, fp=fp_bytes)
+    return weight_size
+
+
+def get_dense_block_weight_summary(model, tp, fp_bytes, ffn_ratio=1.0):
+    attn_layers = ("q_proj", "k_proj", "v_proj", "o_proj")
+    ffn_layers = ("gate_proj", "up_proj", "down_proj")
+    attn_full = sum(get_dense_layer_weight_bytes(model, layer, tp, fp_bytes) for layer in attn_layers)
+    ffn_full = sum(get_dense_layer_weight_bytes(model, layer, tp, fp_bytes) for layer in ffn_layers)
+    ffn_transfer = int(ffn_full * ffn_ratio)
+    return {
+        "attn_full": attn_full,
+        "ffn_full": ffn_full,
+        "ffn_transfer": ffn_transfer,
+        "prefetch_transfer": attn_full + ffn_transfer,
+    }
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp,
+                 enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
+                 hbf_mem=0, hbf_prefetch=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -24,11 +74,18 @@ class MemoryModel():
         self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE 
+        self.hbf_mem = hbf_mem * GB_TO_BYTE
         self.block_size = block_size
         self.fp = fp // 8 # bit -> byte of floating point
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
+        self.hbf_prefetch = hbf_prefetch or {"enabled": False}
+        self.hbf_enabled = bool(self.hbf_prefetch.get("enabled", False))
+        self.ffn_ratio = float(self.hbf_prefetch.get("ffn_ratio", 1.0))
+        self.predict_base_ns = int(self.hbf_prefetch.get("predict_base_ns", 0))
+        self.predict_attn_ns = int(self.hbf_prefetch.get("predict_attn_ns", 0))
+        self.predict_ffn_ns = int(self.hbf_prefetch.get("predict_ffn_ns", 0))
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -40,15 +97,22 @@ class MemoryModel():
         self.kv_dim = self.n_embd // self.group   # equivalent to: kv_head * (n_embd // n_head)
         self.vocab_size = self.config['vocab_size']
         self.is_moe = True if 'num_local_experts' in self.config else False
+        if self.hbf_enabled and self.is_moe:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] HBF prefetch currently supports dense models only."
+            )
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
         # Memory model
-        self.weight = self.get_weight() # assume weight is loaded
+        self.weight, self.hbf_weight = self.get_weight() # assume weight is loaded
         self.npu_used = self.weight
+        self.hbf_used = self.hbf_weight
         self.cpu_used = 0
         if self.weight > self.npu_mem:
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
+        if self.hbf_weight > self.hbf_mem:
+            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: HBF-resident weight {self.hbf_weight*self.npu_num//GB_TO_BYTE}GB exceeds HBF memory {self.hbf_mem*self.npu_num//GB_TO_BYTE}GB")
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
@@ -90,67 +154,76 @@ class MemoryModel():
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
     # get weight of the model 
     def get_weight(self):
-        cwd = os.getcwd()
-        weight = 0
+        hbm_weight = 0
+        hbf_weight = 0
 
         # embedding
-        _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, tp=self.npus_per_group, fp=self.fp)
-        weight += embedding
+        hbm_weight += get_dense_layer_weight_bytes(self.model, 'embedding', self.npus_per_group, self.fp)
 
-        # block
-        block_weight = 0
-        # input layernorm
-        _, input_ln, _ = calculate_sizes(self.model, 'input_layernorm', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += input_ln
-        # qkv
-        _, q, _ = calculate_sizes(self.model, 'q_proj', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += q
-        _, k, _ = calculate_sizes(self.model, 'k_proj', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += k
-        _, v, _ = calculate_sizes(self.model, 'v_proj', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += v
-        # attention dense
-        _, attn_dns, _ = calculate_sizes(self.model, 'o_proj', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += attn_dns
+        # transformer blocks
         if self.is_moe:
-            # gate function for MoE
-            _, gate, _ = calculate_sizes(self.model, 'gate', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += gate
-            # MoE experts
-            _, w1, _ = calculate_sizes(self.model, 'expert.w1', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += w1 
-            _, w2, _ = calculate_sizes(self.model, 'expert.w2', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += w2
-            _, w3, _ = calculate_sizes(self.model, 'expert.w3', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += w3
+            # preserve legacy full-HBM behavior for non-HBF MoE path
+            block_layers = (
+                "input_layernorm", "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate", "expert.w1", "expert.w2", "expert.w3", "post_layernorm"
+            )
+            block_weight = sum(get_dense_layer_weight_bytes(self.model, layer, self.npus_per_group, self.fp) for layer in block_layers)
+            hbm_weight += block_weight * self.n_layer
+        elif self.hbf_enabled:
+            static_block_layers = ("input_layernorm", "post_layernorm")
+            static_block_weight = sum(get_dense_layer_weight_bytes(self.model, layer, self.npus_per_group, self.fp) for layer in static_block_layers)
+            hbm_weight += static_block_weight * self.n_layer
 
+            block_summary = get_dense_block_weight_summary(
+                self.model,
+                tp=self.npus_per_group,
+                fp_bytes=self.fp,
+                ffn_ratio=self.ffn_ratio,
+            )
+            hbf_weight += (block_summary["attn_full"] + block_summary["ffn_full"]) * self.n_layer
+
+            # Simplified double-buffer upper bound for current + prefetched next layer.
+            hbm_weight += block_summary["prefetch_transfer"] * 2
         else:
-            _, ffn1, _ = calculate_sizes(self.model, 'gate_proj', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += ffn1
-            _, ffn2, _ = calculate_sizes(self.model, 'up_proj', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += ffn2
-            _, ffn3, _ = calculate_sizes(self.model, 'down_proj', 1, tp=self.npus_per_group, fp=self.fp)
-            block_weight += ffn3
-   
-        # post layernorm
-        _, post_ln, _ = calculate_sizes(self.model, 'post_layernorm', 1, tp=self.npus_per_group, fp=self.fp)
-        block_weight += post_ln
+            block_layers = (
+                "input_layernorm", "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj", "post_layernorm"
+            )
+            block_weight = sum(get_dense_layer_weight_bytes(self.model, layer, self.npus_per_group, self.fp) for layer in block_layers)
+            hbm_weight += block_weight * self.n_layer
 
-        weight += block_weight * self.n_layer
+        # ln_f + lm_head
+        hbm_weight += get_dense_layer_weight_bytes(self.model, 'final_layernorm', self.npus_per_group, self.fp)
+        hbm_weight += get_dense_layer_weight_bytes(self.model, 'lm_head', self.npus_per_group, self.fp)
 
-        # ln_f
-        _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, tp=self.npus_per_group, fp=self.fp)
-        weight += ln_f
-        # lm_head
-        _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, tp=self.npus_per_group, fp=self.fp)
-        weight += lm_head
+        if self.hbf_enabled:
+            self.logger.info(
+                "HBM resident weight %.2fMB loaded, HBF resident weight %.2fMB loaded",
+                hbm_weight / MB_TO_BYTE,
+                hbf_weight / MB_TO_BYTE,
+            )
+        else:
+            self.logger.info(
+                "NPU: model weight %dMB loaded",
+                hbm_weight * self.npus_per_group // MB_TO_BYTE,
+            )
 
-        self.logger.info(
-            "NPU: model weight %dMB loaded",
-            weight * self.npus_per_group // MB_TO_BYTE,
+        return hbm_weight, hbf_weight
+
+    def get_hbf_prefetch_summary(self):
+        if not self.hbf_enabled:
+            return None
+        return get_dense_block_weight_summary(
+            self.model,
+            tp=self.npus_per_group,
+            fp_bytes=self.fp,
+            ffn_ratio=self.ffn_ratio,
         )
 
-        return weight
+    def get_prefetch_predict_ns(self):
+        if not self.hbf_enabled:
+            return 0
+        return self.predict_base_ns + self.predict_attn_ns + self.predict_ffn_ns
 
 
     def get_kv(self, seq):
@@ -208,9 +281,17 @@ class MemoryModel():
             (self.npu_used - self.weight) / MB_TO_BYTE,
         )
         self.npu_used -= self.weight
+        if self.hbf_used > 0:
+            self.logger.info(
+                "HBF: used: %.2fMB remove: %.2fMB after: %.2fMB",
+                self.hbf_used / MB_TO_BYTE,
+                self.hbf_weight / MB_TO_BYTE,
+                (self.hbf_used - self.hbf_weight) / MB_TO_BYTE,
+            )
+            self.hbf_used -= self.hbf_weight
 
     def is_free(self):
-        return self.npu_used == 0 and self.cpu_used == 0
+        return self.npu_used == 0 and self.cpu_used == 0 and self.hbf_used == 0
 
     # -------------------- Memory Management --------------------
     
@@ -245,6 +326,13 @@ class MemoryModel():
                 self.cpu_used += size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.allocate(size)
+        elif device == Device.HBF:
+            if self.hbf_used + size > self.hbf_mem:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] HBF: tried to load {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {(self.hbf_mem - self.hbf_used) / MB_TO_BYTE:.2f}MB is available."
+                )
+            self.hbf_used += size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
@@ -280,6 +368,13 @@ class MemoryModel():
                 self.cpu_used -= size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.free(size)
+        elif device == Device.HBF:
+            if self.hbf_used - size < 0:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] HBF: tried to free {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {self.hbf_used / MB_TO_BYTE:.2f}MB is used."
+                )
+            self.hbf_used -= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
     
@@ -299,6 +394,8 @@ class MemoryModel():
                     return False 
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.is_avail(size)
+        elif device == Device.HBF:
+            return self.hbf_mem - self.hbf_used >= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
     
@@ -320,6 +417,9 @@ class MemoryModel():
                     return 0
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.need_size(size)
+        elif device == Device.HBF:
+            needed = (size - (self.hbf_mem - self.hbf_used))
+            return needed if needed > 0 else 0
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
