@@ -14,9 +14,10 @@ import numpy as np
 # class that shedules request of astra-sim
 class Scheduler:
     def __init__(self, model, node_id, instance_id, max_batch, max_num_batched_tokens, 
-                 npu_num, npu_group, npu_mem, cpu_mem, 
+                 npu_num, npu_group, npu_mem, npu_mem_bw, cpu_mem, 
                  start_npu, pd_type, fp, block_size, req_num, 
-                 prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+                 prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
+                 placement=None, hbf_mem=None, bw_mode="shared_frontend"):
         # all time realated variables are in using tick (system tick)
         # LLMServingSim uses Orca, vLLM technique at deafult
         self.model = model
@@ -43,7 +44,26 @@ class Scheduler:
         self.first_arrival_time = 0
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem)
+        self.memory = MemoryModel(
+            model,
+            instance_id,
+            node_id,
+            npu_num,
+            npu_group,
+            npu_mem,
+            npu_mem_bw,
+            cpu_mem,
+            block_size,
+            fp,
+            enable_prefix_caching,
+            enable_prefix_sharing,
+            prefix_pool,
+            prefix_storage,
+            cxl_mem,
+            placement,
+            hbf_mem,
+            bw_mode,
+        )
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)

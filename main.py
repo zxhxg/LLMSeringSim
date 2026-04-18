@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
+    parser.add_argument('--hbf-bw-mode', type=str, choices=['shared_frontend', 'fully_independent', 'fully_serialized'], help='override HBF frontend bandwidth model', default=None)
 
     args = parser.parse_args()
 
@@ -94,7 +95,7 @@ def main():
     log_interval=args.log_interval
     network_backend = args.network_backend
     # ---------------------------------- Extract cluster config -----------------------------------
-    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading)
+    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, args.hbf_bw_mode)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -109,9 +110,24 @@ def main():
     block_mode_on = cluster["block_mode_on"]
     total_npu = cluster["total_npu"]
     cpu_mem_size = cluster["cpu_mem_size"]
+    hbf_mem_cfg = cluster["hbf_mem"]
+    hbf_enabled = cluster["hbf_enabled"]
+    hbf_bw_mode = cluster["bw_mode"]
     power_modeling = cluster["power_modeling"]
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
+
+    print(f"HBF enabled: {hbf_enabled}")
+    if hbf_enabled:
+        print(
+            "HBF config: "
+            f"size={hbf_mem_cfg['mem_size']}GB, bw={hbf_mem_cfg['mem_bw']}GB/s, "
+            f"latency={hbf_mem_cfg['mem_latency']}ns, devices={hbf_mem_cfg['num_devices']}, "
+            f"bw_mode={hbf_bw_mode}"
+        )
+    else:
+        print(f"HBF bw_mode: {hbf_bw_mode} (inactive because no hbf_mem is configured)")
+    print(SINGLE_BAR)
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
@@ -198,9 +214,10 @@ def main():
         # Make scheduler for each instance
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id, max_batch, max_num_batched_tokens,
-            instance["npu_num"], instance["npu_group"], instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
+            instance["npu_num"], instance["npu_group"], instance["npu_mem"]["mem_size"], instance["npu_mem"]["mem_bw"], cpu_mem_size[instance["node_id"]],
             inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req, 
-            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem
+            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem,
+            placement[instance_id], hbf_mem_cfg, hbf_bw_mode
         ))
 
     # Controller for astra-sim process communication
@@ -319,7 +336,7 @@ def main():
                 generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"], 
                                node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
                                expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction, 
-                               enable_sub_batch_interleaving, fp)
+                               enable_sub_batch_interleaving, fp, schedulers[instance_id].memory)
                 generate_graph(new_req, instance["hardware"], instance["npu_num"], node_id,
                                instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
             workload = get_workload(new_req, instance["hardware"], instance_id)
@@ -355,6 +372,11 @@ def main():
             
                 print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
                 print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
+                if mem.hbf_enabled:
+                    hbf_used_mb = mem.hbf_used_size / MB_TO_BYTE
+                    hbf_cap_mb = mem.hbf_total_size / MB_TO_BYTE if mem.hbf_total_size else 0.0
+                    hbf_util = (mem.hbf_used_size / mem.hbf_total_size * 100.0) if mem.hbf_total_size else 0.0
+                    print(f", HBF Weight Usage {hbf_used_mb:.2f} MB / {hbf_cap_mb:.2f} MB ({hbf_util:.3f} % Used)", end='')
                 if enable_prefix_caching:
                     schedulers[inst_id].memory.npu_prefix_cache.print_prefix_info()
                 print()
@@ -497,6 +519,24 @@ def main():
     print(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
     print(f"Throughput per {1/RATIO} sec: {throughput}")
     print(SINGLE_BAR)
+    total_hbf_stats = {
+        "hbf_total_size": sum(s.memory.hbf_total_size for s in schedulers),
+        "hbf_used_size": sum(s.memory.hbf_used_size for s in schedulers),
+        "hbf_read_bytes": sum(s.memory.hbf_read_bytes for s in schedulers),
+        "hbf_read_requests": sum(s.memory.hbf_read_requests for s in schedulers),
+        "hbf_read_time_us": sum(s.memory.hbf_read_time_us for s in schedulers),
+    }
+    if hbf_enabled:
+        print(magenta(center("HBF Results")))
+        print(SINGLE_BAR)
+        print(f"HBF enabled:                                                        {hbf_enabled}")
+        print(f"HBF bw_mode:                                                        {hbf_bw_mode}")
+        print(f"HBF total capacity (MB):                                            {total_hbf_stats['hbf_total_size']/MB_TO_BYTE:.2f}")
+        print(f"HBF used for resident weights (MB):                                 {total_hbf_stats['hbf_used_size']/MB_TO_BYTE:.2f}")
+        print(f"HBF read bytes (MB):                                                {total_hbf_stats['hbf_read_bytes']/MB_TO_BYTE:.2f}")
+        print(f"HBF read requests:                                                  {total_hbf_stats['hbf_read_requests']}")
+        print(f"HBF modeled read time (us):                                         {total_hbf_stats['hbf_read_time_us']:.2f}")
+        print(SINGLE_BAR)
     if enable_prefix_caching:
         print(magenta(center("Prefix Caching Results")))
         print(SINGLE_BAR)

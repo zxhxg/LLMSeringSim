@@ -15,9 +15,10 @@ def represent_flowstyle_list(dumper, data):
 yaml.add_representer(FlowStyleList, represent_flowstyle_list)
 
 logger = get_logger("ConfigBuilder")
+VALID_HBF_BW_MODES = {"shared_frontend", "fully_independent", "fully_serialized"}
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, hbf_bw_mode=None):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
     
     try:
@@ -64,6 +65,31 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             "num-devices": cxl.get("num_devices", 1)
         }
         cxl_mem_size = cxl["mem_size"]
+
+    hbf_mem_cfg = None
+    if "hbf_mem" in cluster_config:
+        hbf = cluster_config["hbf_mem"]
+        for key in mem_required_keys:
+            if key not in hbf:
+                raise KeyError(f"Missing required key '{key}' in 'hbf_mem' configuration.")
+        memory_config["hbf_mem"] = {
+            "memory-type": "PER_NPU_MEMORY_EXPANSION",
+            "mem-bw": hbf["mem_bw"],
+            "mem-latency": hbf["mem_latency"],
+            "num-devices": hbf.get("num_devices", 1),
+        }
+        hbf_mem_cfg = {
+            "mem_size": hbf["mem_size"],
+            "mem_bw": hbf["mem_bw"],
+            "mem_latency": hbf["mem_latency"],
+            "num_devices": hbf.get("num_devices", 1),
+        }
+
+    bw_mode = hbf_bw_mode or cluster_config.get("bw_mode", "shared_frontend")
+    if bw_mode not in VALID_HBF_BW_MODES:
+        raise ValueError(
+            f"Invalid bw_mode '{bw_mode}'. Supported values: {sorted(VALID_HBF_BW_MODES)}"
+        )
 
     # Check if all required arguments are present in each node
     required_keys = ["num_instances", "cpu_mem", "instances"]
@@ -396,6 +422,9 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "total_npu": total_npu,
         "cpu_mem_size": cpu_mem_size,
         "cxl_mem_size": cxl_mem_size,
+        "hbf_mem": hbf_mem_cfg,
+        "hbf_enabled": hbf_mem_cfg is not None,
+        "bw_mode": bw_mode,
         "power_modeling": power_modeling,
         "power_configs": power_configs,
         "pim_models": pim_models
@@ -553,6 +582,8 @@ def _mem_str(loc, node_id):
     elif loc.upper().startswith("CPU"):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
+        return loc.upper()
+    elif loc.upper().startswith("HBF"):
         return loc.upper()
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")

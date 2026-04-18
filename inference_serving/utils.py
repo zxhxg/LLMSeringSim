@@ -133,6 +133,7 @@ def print_input_config(args):
     add("enable_sub_batch_interleaving", "Sub-batch interleaving", _yn)
     add("enable_attn_prediction", "Realtime attention prediction", _yn)
     add("prioritize_prefill",     "Prioritize prefill", _yn)
+    add("hbf_bw_mode",            "HBF bw_mode", _na)
 
     add("link_bw",                "Link bandwidth (GB/s)")
     add("link_latency",           "Link latency (ns)")

@@ -46,6 +46,8 @@ Pass a config file to `main.py` via `--cluster-config cluster_config/{name}.json
 | `num_nodes` | Integer | Number of nodes in the cluster |
 | `link_bw` | Float | Inter-node link bandwidth in GB/s |
 | `link_latency` | Float | Inter-node link latency in ns |
+| `bw_mode` | String | HBF frontend bandwidth model: `shared_frontend`, `fully_independent`, or `fully_serialized` |
+| `hbf_mem` | Object | Optional HBF weight-memory tier (`mem_size`, `mem_bw`, `mem_latency`, `num_devices`) |
 
 ### Per-node fields
 
@@ -78,6 +80,42 @@ Pass a config file to `main.py` via `--cluster-config cluster_config/{name}.json
 | `power` | Object | Power configuration for the power model |
 | `cxl_mem` | Object | CXL memory expansion parameters (`mem_size`, `mem_bw`, `mem_latency`) |
 
+## HBF configuration
+
+Task 1 adds a GPU-side HBF tier for dense layer-wise weight reads. Enable it by
+declaring `hbf_mem` at the top level and setting weight placement to `hbf:x`.
+
+```json
+"hbf_mem": {
+  "mem_size": 1024,
+  "mem_bw": 1536,
+  "mem_latency": 50,
+  "num_devices": 1
+},
+"bw_mode": "shared_frontend"
+```
+
+`bw_mode` controls how HBF traffic shares the path into compute:
+
+- `shared_frontend`: default mode, HBF traffic is limited by the shared frontend path.
+- `fully_independent`: optimistic upper bound, only HBF tier latency/bandwidth is counted.
+- `fully_serialized`: pessimistic lower bound, HBF transfer plus frontend transfer are serialized.
+
+Example placement:
+
+```json
+"placement": {
+  "default": {
+    "weights": "hbf:0",
+    "kv_loc": "npu",
+    "kv_evict_loc": "cpu"
+  }
+}
+```
+
+Only the fields above are consumed by the current Task 1 implementation. No sparse,
+page-mapping, or request-replay HBF features are implied.
+
 ## Provided configurations
 
 | File | Description |
@@ -93,4 +131,7 @@ Pass a config file to `main.py` via `--cluster-config cluster_config/{name}.json
 | `single_node_pim_instance.json` | Single node with PIM-enabled memory |
 | `single_node_power_instance.json` | Single node with power modeling enabled |
 | `single_node_memory_instance.json` | Single node memory hierarchy configuration |
+| `single_node_hbf_shared_frontend.json` | Single node HBM + HBF with default frontend-sharing model |
+| `single_node_hbf_fully_independent.json` | Single node HBM + HBF optimistic upper-bound model |
+| `single_node_hbf_fully_serialized.json` | Single node HBM + HBF pessimistic lower-bound model |
 | `dual_node_multi_instance.json` | Dual node, multiple instances |

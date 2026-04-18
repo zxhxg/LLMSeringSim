@@ -36,10 +36,43 @@ _attn_prediction_value_cache = {}
 
 logger = get_logger("TraceGenerator")
 
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _apply_hbf_postprocess(rows, memory_model):
+    if memory_model is None or not getattr(memory_model, "hbf_enabled", False):
+        return rows
+
+    processed = []
+    for row in rows:
+        if len(row) < 11:
+            processed.append(row)
+            continue
+        if row[0] in {"EXPERT", "PIM"}:
+            processed.append(row)
+            continue
+
+        weight_loc = str(row[4]).upper()
+        weight_size = _safe_int(row[5], 0)
+        if not weight_loc.startswith("HBF") or weight_size <= 0:
+            processed.append(row)
+            continue
+
+        updated_row = list(row)
+        updated_row[1] = str(_safe_int(updated_row[1], 0) + memory_model.record_hbf_read(weight_size))
+        processed.append(updated_row)
+
+    return processed
+
 # Wrapper function that creates trace for a instance
 def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0, instance_id=0,
                     max_num_batched_tokens=2048, placement={}, block_mode_on=False, expert_routing_policy="RR",
-                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None, enable_attn_prediction=False, enable_sub_batch_interleaving=False, fp=16):
+                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None, enable_attn_prediction=False, enable_sub_batch_interleaving=False, fp=16, memory_model=None):
 
     model = batch.model
     config = get_config(model)
@@ -86,6 +119,7 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
         for line in f.readlines():
             split = re.findall(r'\S+', line)
             dic.append(split)
+    dic = _apply_hbf_postprocess(dic, memory_model)
 
     # vllm: open output txt file and add load, evict mem 
     mem = []

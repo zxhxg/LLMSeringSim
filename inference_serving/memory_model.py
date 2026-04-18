@@ -1,6 +1,8 @@
 import os, threading
 from .utils import get_config
 from .radix_tree import *
+from .config_builder import get_device
+from .logger import get_logger
 import logging
 from enum import Enum
 
@@ -12,9 +14,32 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    HBF = 4
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+    VALID_HBF_BW_MODES = {"shared_frontend", "fully_independent", "fully_serialized"}
+
+    def __init__(
+        self,
+        model,
+        instance_id,
+        node_id,
+        npu_num,
+        npu_group,
+        npu_mem,
+        npu_mem_bw,
+        cpu_mem,
+        block_size,
+        fp,
+        enable_prefix_caching,
+        enable_prefix_sharing,
+        prefix_pool,
+        prefix_storage,
+        cxl_mem=0,
+        placement=None,
+        hbf_mem=None,
+        bw_mode="shared_frontend",
+    ):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -22,6 +47,7 @@ class MemoryModel():
         self.npu_group = npu_group
         self.npus_per_group = npu_num // npu_group
         self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
+        self.npu_mem_bw = float(npu_mem_bw)
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE 
         self.block_size = block_size
@@ -29,6 +55,26 @@ class MemoryModel():
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
+        self.placement = placement or {
+            "default": {"weights": "LOCAL", "kv_loc": "LOCAL", "kv_evict_loc": f"REMOTE:{node_id}"},
+            "block": [],
+            "layer": {},
+        }
+        self.hbf_cfg = hbf_mem or {}
+        self.hbf_bw_mode = bw_mode or "shared_frontend"
+        if self.hbf_bw_mode not in self.VALID_HBF_BW_MODES:
+            raise ValueError(
+                f"Unsupported HBF bw_mode '{self.hbf_bw_mode}'. Expected one of {sorted(self.VALID_HBF_BW_MODES)}"
+            )
+        self.hbf_mem = int(self.hbf_cfg.get("mem_size", 0) * GB_TO_BYTE)
+        self.hbf_bw = float(self.hbf_cfg.get("mem_bw", 0))
+        self.hbf_latency_ns = float(self.hbf_cfg.get("mem_latency", 0))
+        self.hbf_num_devices = int(self.hbf_cfg.get("num_devices", 0)) if self.hbf_mem > 0 else 0
+        self.hbf_total_size = self.hbf_mem
+        self.hbf_used_size = 0
+        self.hbf_read_bytes = 0
+        self.hbf_read_requests = 0
+        self.hbf_read_time_us = 0.0
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -44,11 +90,30 @@ class MemoryModel():
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
         # Memory model
-        self.weight = self.get_weight() # assume weight is loaded
+        self.layer_weight_sizes = self._build_layer_weight_sizes()
+        self.total_weight = self.get_weight()
+        weight_summary = self._summarize_weight_placement()
+        self.weight = weight_summary["local"]
+        self.remote_weight = weight_summary["remote"]
+        self.cxl_weight = weight_summary["cxl"]
+        self.hbf_used_size = weight_summary["hbf"]
         self.npu_used = self.weight
         self.cpu_used = 0
         if self.weight > self.npu_mem:
-            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
+            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Local resident model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
+        if self.hbf_used_size > self.hbf_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: HBF resident model size "
+                f"{self.hbf_used_size / GB_TO_BYTE:.2f}GB exceeds configured HBF capacity {self.hbf_mem / GB_TO_BYTE:.2f}GB"
+            )
+        self.logger.info(
+            "Weight placement summary: total=%.2fMB, resident NPU=%.2fMB, HBF=%.2fMB, remote=%.2fMB, CXL=%.2fMB",
+            self.total_weight / MB_TO_BYTE,
+            self.weight / MB_TO_BYTE,
+            self.hbf_used_size / MB_TO_BYTE,
+            self.remote_weight / MB_TO_BYTE,
+            self.cxl_weight / MB_TO_BYTE,
+        )
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
@@ -90,7 +155,6 @@ class MemoryModel():
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
     # get weight of the model 
     def get_weight(self):
-        cwd = os.getcwd()
         weight = 0
 
         # embedding
@@ -146,11 +210,148 @@ class MemoryModel():
         weight += lm_head
 
         self.logger.info(
-            "NPU: model weight %dMB loaded",
-            weight * self.npus_per_group // MB_TO_BYTE,
+            "Computed total model weight footprint: %.2fMB",
+            weight / MB_TO_BYTE,
         )
 
         return weight
+
+    def _build_layer_weight_sizes(self):
+        tp = self.npus_per_group
+        sizes = {
+            "embedding": calculate_sizes(self.model, "embedding", 1, tp=tp, fp=self.fp)[1],
+            "input_layernorm": calculate_sizes(self.model, "input_layernorm", 1, tp=tp, fp=self.fp)[1],
+            "q_proj": calculate_sizes(self.model, "q_proj", 1, tp=tp, fp=self.fp)[1],
+            "k_proj": calculate_sizes(self.model, "k_proj", 1, tp=tp, fp=self.fp)[1],
+            "v_proj": calculate_sizes(self.model, "v_proj", 1, tp=tp, fp=self.fp)[1],
+            "rope": 0,
+            "attn": 0,
+            "o_proj": calculate_sizes(self.model, "o_proj", 1, tp=tp, fp=self.fp)[1],
+            "post_layernorm": calculate_sizes(self.model, "post_layernorm", 1, tp=tp, fp=self.fp)[1],
+            "act_fn": 0,
+            "final_layernorm": calculate_sizes(self.model, "final_layernorm", 1, tp=tp, fp=self.fp)[1],
+            "lm_head": calculate_sizes(self.model, "lm_head", 1, tp=tp, fp=self.fp)[1],
+        }
+        if self.is_moe:
+            sizes["gate"] = calculate_sizes(self.model, "gate", 1, tp=tp, fp=self.fp)[1]
+            sizes["expert"] = (
+                calculate_sizes(self.model, "expert.w1", 1, tp=tp, fp=self.fp)[1]
+                + calculate_sizes(self.model, "expert.w2", 1, tp=tp, fp=self.fp)[1]
+                + calculate_sizes(self.model, "expert.w3", 1, tp=tp, fp=self.fp)[1]
+            )
+        else:
+            sizes["gate_proj"] = calculate_sizes(self.model, "gate_proj", 1, tp=tp, fp=self.fp)[1]
+            sizes["up_proj"] = calculate_sizes(self.model, "up_proj", 1, tp=tp, fp=self.fp)[1]
+            sizes["down_proj"] = calculate_sizes(self.model, "down_proj", 1, tp=tp, fp=self.fp)[1]
+            sizes["gate"] = 0
+            sizes["expert"] = 0
+        return sizes
+
+    def get_layer_weight_size(self, layer_name):
+        return int(self.layer_weight_sizes.get(layer_name, 0))
+
+    def _iter_weight_placement(self):
+        block_layer_names = [
+            "input_layernorm",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "rope",
+            "attn",
+            "o_proj",
+            "post_layernorm",
+        ]
+        if self.is_moe:
+            block_layer_names.extend(["gate", "expert"])
+        else:
+            block_layer_names.extend(["gate_proj", "up_proj", "act_fn", "down_proj"])
+
+        yield (None, "embedding", self.get_layer_weight_size("embedding"), get_device(self.placement, None, "embedding", "weights"))
+        for block_idx in range(self.n_layer):
+            for layer_name in block_layer_names:
+                yield (
+                    block_idx,
+                    layer_name,
+                    self.get_layer_weight_size(layer_name),
+                    get_device(self.placement, block_idx, layer_name, "weights"),
+                )
+        yield (None, "final_layernorm", self.get_layer_weight_size("final_layernorm"), get_device(self.placement, None, "final_layernorm", "weights"))
+        yield (None, "lm_head", self.get_layer_weight_size("lm_head"), get_device(self.placement, None, "lm_head", "weights"))
+
+    def _summarize_weight_placement(self):
+        summary = {"local": 0, "hbf": 0, "remote": 0, "cxl": 0}
+        for _, _, weight_size, location in self._iter_weight_placement():
+            if weight_size <= 0:
+                continue
+            prefix = str(location).split(":", 1)[0].upper()
+            if prefix == "LOCAL":
+                summary["local"] += weight_size
+            elif prefix == "HBF":
+                if self.hbf_mem <= 0:
+                    raise RuntimeError(
+                        f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] HBF placement requested without hbf_mem configuration"
+                    )
+                summary["hbf"] += weight_size
+            elif prefix == "REMOTE":
+                summary["remote"] += weight_size
+            elif prefix == "CXL":
+                summary["cxl"] += weight_size
+            else:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] Unsupported weight placement location '{location}'"
+                )
+        return summary
+
+    def _transfer_time_ns(self, size_bytes, bw_gbps):
+        if size_bytes <= 0 or bw_gbps <= 0:
+            return 0
+        bytes_per_sec = bw_gbps * GB_TO_BYTE
+        return int((size_bytes / bytes_per_sec) * 1_000_000_000)
+
+    @property
+    def hbf_enabled(self):
+        return self.hbf_total_size > 0
+
+    def get_hbf_frontend_penalty_ns(self, size_bytes):
+        if size_bytes <= 0 or not self.hbf_enabled:
+            return 0
+
+        if self.hbf_bw_mode == "fully_independent":
+            return 0
+
+        if self.hbf_bw_mode == "shared_frontend":
+            effective_bw = min(self.hbf_bw, self.npu_mem_bw)
+            return max(0, self._transfer_time_ns(size_bytes, effective_bw) - self._transfer_time_ns(size_bytes, self.hbf_bw))
+
+        if self.hbf_bw_mode == "fully_serialized":
+            return self._transfer_time_ns(size_bytes, self.npu_mem_bw)
+
+        raise RuntimeError(f"Unsupported HBF bw_mode '{self.hbf_bw_mode}'")
+
+    def get_hbf_total_read_time_ns(self, size_bytes):
+        if size_bytes <= 0 or not self.hbf_enabled:
+            return 0
+        base_time_ns = int(self.hbf_latency_ns) + self._transfer_time_ns(size_bytes, self.hbf_bw)
+        return base_time_ns + self.get_hbf_frontend_penalty_ns(size_bytes)
+
+    def record_hbf_read(self, size_bytes):
+        if size_bytes <= 0 or not self.hbf_enabled:
+            return 0
+        self.hbf_read_bytes += size_bytes
+        self.hbf_read_requests += 1
+        self.hbf_read_time_us += self.get_hbf_total_read_time_ns(size_bytes) / 1_000.0
+        return self.get_hbf_frontend_penalty_ns(size_bytes)
+
+    def get_hbf_stats(self):
+        return {
+            "enabled": self.hbf_enabled,
+            "bw_mode": self.hbf_bw_mode,
+            "hbf_total_size": self.hbf_total_size,
+            "hbf_used_size": self.hbf_used_size,
+            "hbf_read_bytes": self.hbf_read_bytes,
+            "hbf_read_requests": self.hbf_read_requests,
+            "hbf_read_time_us": self.hbf_read_time_us,
+        }
 
 
     def get_kv(self, seq):

@@ -1,0 +1,171 @@
+================================================================================
+[1m                                LLMServingSim2.0                                [0m
+[95m  A Unified Simulator for Heterogeneous Hardware and Serving Techniques in LLM  [0m
+================================================================================
+[96m     _    _    __  __ ___              _           ___ _       ___   __  
+    | |  | |  |  \/  / __| ___ _ ___ _(_)_ _  __ _/ __(_)_ __ |_  ) /  \ 
+    | |__| |__| |\/| \__ \/ -_) '_\ V / | ' \/ _` \__ \ | '  \ / / | () |
+    |____|____|_|  |_|___/\___|_|  \_/|_|_||_\__, |___/_|_|_|_/___(_)__/ 
+                                             |___/       [0m
+--------------------------------------------------------------------------------
+[95m                              Input configuration                               [0m
+
+  • [96mCluster config               [0m : cluster_config/single_node_hbf_fully_independent.json
+  • [96mDataset                      [0m : dataset/sharegpt_req100_rate10_llama.jsonl
+  • [96mNum requests                 [0m : 100
+  • [96mMax batch                    [0m : inf
+  • [96mMax batched tokens           [0m : 2048
+  • [96mBlock size (tokens)          [0m : 16
+  • [96mFP precision                 [0m : 16-bit
+  • [96mRequest routing              [0m : RR
+  • [96mExpert routing               [0m : FAST
+  • [96mPrefix caching               [0m : DISABLED
+  • [96mPrefix caching scheme        [0m : xPU-Only
+  • [96mCentralized prefix caching   [0m : DISABLED
+  • [96mOffload attention to PIM     [0m : DISABLED
+  • [96mSub-batch interleaving       [0m : DISABLED
+  • [96mRealtime attention prediction[0m : DISABLED
+  • [96mPrioritize prefill           [0m : DISABLED
+  • [96mHBF bw_mode                  [0m : N/A
+  • [96mNetwork backend              [0m : analytical
+  • [96mLog interval (s)             [0m : 1.0
+  • [96mLog level                    [0m : WARNING
+--------------------------------------------------------------------------------
+[1m[96m▶ Starting simulation...
+[0m[0m
+HBF enabled: True
+HBF config: size=1024GB, bw=1536GB/s, latency=50ns, devices=1, bw_mode=fully_independent
+--------------------------------------------------------------------------------
+[1.0s] [94mAvg prompt throughput: 661.0 tokens/s,[0m [94mAvg generation throughput: 137.0 tokens/s[0m
+        ├─Running Instance[0]: 9 reqs, Total # 1 NPUs, Each NPU Memory Usage 110.00 MB (0.269 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[2.0s] [94mAvg prompt throughput: 1473.0 tokens/s,[0m [94mAvg generation throughput: 401.0 tokens/s[0m
+        ├─Running Instance[0]: 24 reqs, Total # 1 NPUs, Each NPU Memory Usage 436.00 MB (1.064 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[3.0s] [94mAvg prompt throughput: 1529.0 tokens/s,[0m [94mAvg generation throughput: 823.0 tokens/s[0m
+        ├─Running Instance[0]: 31 reqs, Total # 1 NPUs, Each NPU Memory Usage 638.00 MB (1.558 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[4.0s] [94mAvg prompt throughput: 4293.0 tokens/s,[0m [94mAvg generation throughput: 440.0 tokens/s[0m
+        ├─Running Instance[0]: 44 reqs, Total # 1 NPUs, Each NPU Memory Usage 1328.00 MB (3.242 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[5.0s] [94mAvg prompt throughput: 1918.0 tokens/s,[0m [94mAvg generation throughput: 861.0 tokens/s[0m
+        ├─Running Instance[0]: 46 reqs, Total # 1 NPUs, Each NPU Memory Usage 1580.00 MB (3.857 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[6.0s] [94mAvg prompt throughput: 2368.0 tokens/s,[0m [94mAvg generation throughput: 978.0 tokens/s[0m
+        ├─Running Instance[0]: 54 reqs, Total # 1 NPUs, Each NPU Memory Usage 1766.00 MB (4.312 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[7.0s] [94mAvg prompt throughput: 2241.0 tokens/s,[0m [94mAvg generation throughput: 1073.0 tokens/s[0m
+        ├─Running Instance[0]: 58 reqs, Total # 1 NPUs, Each NPU Memory Usage 1916.00 MB (4.678 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[8.0s] [94mAvg prompt throughput: 3228.0 tokens/s,[0m [94mAvg generation throughput: 1072.0 tokens/s[0m
+        ├─Running Instance[0]: 71 reqs, Total # 1 NPUs, Each NPU Memory Usage 2446.00 MB (5.972 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[9.0s] [94mAvg prompt throughput: 1723.0 tokens/s,[0m [94mAvg generation throughput: 1251.0 tokens/s[0m
+        ├─Running Instance[0]: 77 reqs, Total # 1 NPUs, Each NPU Memory Usage 2718.00 MB (6.636 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+        └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[10.0s] [94mAvg prompt throughput: 1593.0 tokens/s,[0m [94mAvg generation throughput: 1539.0 tokens/s[0m
+         ├─Running Instance[0]: 71 reqs, Total # 1 NPUs, Each NPU Memory Usage 2842.00 MB (6.938 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[11.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1910.0 tokens/s[0m
+         ├─Running Instance[0]: 65 reqs, Total # 1 NPUs, Each NPU Memory Usage 2676.00 MB (6.533 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[12.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1893.0 tokens/s[0m
+         ├─Running Instance[0]: 58 reqs, Total # 1 NPUs, Each NPU Memory Usage 2674.00 MB (6.528 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[13.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1733.0 tokens/s[0m
+         ├─Running Instance[0]: 53 reqs, Total # 1 NPUs, Each NPU Memory Usage 2764.00 MB (6.748 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[14.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1629.0 tokens/s[0m
+         ├─Running Instance[0]: 44 reqs, Total # 1 NPUs, Each NPU Memory Usage 2444.00 MB (5.967 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[15.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1341.0 tokens/s[0m
+         ├─Running Instance[0]: 34 reqs, Total # 1 NPUs, Each NPU Memory Usage 2058.00 MB (5.024 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[16.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1141.0 tokens/s[0m
+         ├─Running Instance[0]: 31 reqs, Total # 1 NPUs, Each NPU Memory Usage 1962.00 MB (4.790 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[17.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 1030.0 tokens/s[0m
+         ├─Running Instance[0]: 25 reqs, Total # 1 NPUs, Each NPU Memory Usage 1574.00 MB (3.843 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[18.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 804.0 tokens/s[0m
+         ├─Running Instance[0]: 20 reqs, Total # 1 NPUs, Each NPU Memory Usage 1382.00 MB (3.374 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[19.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 631.0 tokens/s[0m
+         ├─Running Instance[0]: 16 reqs, Total # 1 NPUs, Each NPU Memory Usage 1062.00 MB (2.593 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[20.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 528.0 tokens/s[0m
+         ├─Running Instance[0]: 14 reqs, Total # 1 NPUs, Each NPU Memory Usage 968.00 MB (2.363 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[21.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 473.0 tokens/s[0m
+         ├─Running Instance[0]: 11 reqs, Total # 1 NPUs, Each NPU Memory Usage 844.00 MB (2.061 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[22.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 394.0 tokens/s[0m
+         ├─Running Instance[0]: 9 reqs, Total # 1 NPUs, Each NPU Memory Usage 718.00 MB (1.753 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[23.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 318.0 tokens/s[0m
+         ├─Running Instance[0]: 8 reqs, Total # 1 NPUs, Each NPU Memory Usage 680.00 MB (1.660 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[24.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 277.0 tokens/s[0m
+         ├─Running Instance[0]: 7 reqs, Total # 1 NPUs, Each NPU Memory Usage 648.00 MB (1.582 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[25.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 259.0 tokens/s[0m
+         ├─Running Instance[0]: 7 reqs, Total # 1 NPUs, Each NPU Memory Usage 680.00 MB (1.660 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[26.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 234.0 tokens/s[0m
+         ├─Running Instance[0]: 5 reqs, Total # 1 NPUs, Each NPU Memory Usage 470.00 MB (1.147 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[27.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 108.0 tokens/s[0m
+         ├─Running Instance[0]: 1 reqs, Total # 1 NPUs, Each NPU Memory Usage 82.00 MB (0.200 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+[28.0s] [94mAvg prompt throughput: 0.0 tokens/s,[0m [94mAvg generation throughput: 36.0 tokens/s[0m
+         ├─Running Instance[0]: 1 reqs, Total # 1 NPUs, Each NPU Memory Usage 88.00 MB (0.215 % Used), HBF Weight Usage 15316.51 MB / 1048576.00 MB (1.461 % Used)
+         └─Node[0]: Total CPU Memory Usage 0.00 MB, 0.000 % Used 
+--------------------------------------------------------------------------------
+[1m[96m▶ Exiting simulation...
+[0m[0m
+Checking Non-Exited Systems ...
+All Request Has Been Exited
+--------------------------------------------------------------------------------
+[1m[96m▶ Simulation results...
+[0m[0m
+Total simulation time: 0h 2m 39.459s
+--------------------------------------------------------------------------------
+[95m                               Throughput Results                               [0m
+--------------------------------------------------------------------------------
+Total requests:                                                     100
+Total clocks (ns):                                                  28724996984
+Total latency (s):                                                  28.725
+Total input tokens:                                                 21027
+Total generated tokens:                                             23339
+Request throughput (req/s):                                         3.48
+Average prompt throughput (tok/s):                                  732.01
+Average generation throughput (tok/s):                              812.50
+Total token throughput (tok/s):                                     1544.51
+Throughput per 1.0 sec: [(661.0, 137.0), (1473.0, 401.0), (1529.0, 823.0), (4293.0, 440.0), (1918.0, 861.0), (2368.0, 978.0), (2241.0, 1073.0), (3228.0, 1072.0), (1723.0, 1251.0), (1593.0, 1539.0), (0.0, 1910.0), (0.0, 1893.0), (0.0, 1733.0), (0.0, 1629.0), (0.0, 1341.0), (0.0, 1141.0), (0.0, 1030.0), (0.0, 804.0), (0.0, 631.0), (0.0, 528.0), (0.0, 473.0), (0.0, 394.0), (0.0, 318.0), (0.0, 277.0), (0.0, 259.0), (0.0, 234.0), (0.0, 108.0), (0.0, 36.0)]
+--------------------------------------------------------------------------------
+[95m                                  HBF Results                                   [0m
+--------------------------------------------------------------------------------
+HBF enabled:                                                        True
+HBF bw_mode:                                                        fully_independent
+HBF total capacity (MB):                                            1048576.00
+HBF used for resident weights (MB):                                 15316.51
+HBF read bytes (MB):                                                13355994.81
+HBF read requests:                                                  253752
+HBF modeled read time (us):                                         8504070.13
+--------------------------------------------------------------------------------
+[95m                                  Instance [0]                                  [0m
+--------------------------------------------------------------------------------
+------------------------------Time to First Token-------------------------------
+Mean TTFT (ms):                                                     130.31
+Median TTFT (ms):                                                   102.18
+P99 TTFT (ms):                                                      340.09
+--------------------Time per Output Token (excl. 1st token)---------------------
+Mean TPOT (ms):                                                     43.22
+Median TPOT (ms):                                                   40.98
+P99 TPOT (ms):                                                      100.44
+------------------------------Inter-token Latency-------------------------------
+Mean ITL (ms):                                                      38.18
+Median ITL (ms):                                                    31.86
+P99 ITL (ms):                                                       203.91
+--------------------------------------------------------------------------------
+Saving each request's information to output file: output/task1_hbf_fully_independent.csv
